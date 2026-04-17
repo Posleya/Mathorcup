@@ -129,7 +129,7 @@ $$
 对回归任务使用 **Elastic Net**（弹性网络正则化）：
 
 $$
-\hat{\boldsymbol{\beta}} = \arg\min_{\boldsymbol{\beta}} \left\{ \frac{1}{2n}\|\mathbf{y} - \mathbf{X}\boldsymbol{\beta}\|_2^2 + \lambda\left[\alpha\|\boldsymbol{\beta}\|_1 + \frac{1-\alpha}{2}\|\boldsymbol{\beta}\|_2^2\right] \right\}
+\hat{\boldsymbol{\beta}} = \arg\min_{\boldsymbol{\beta}} \left\lbrace \frac{1}{2n}\lVert\mathbf{y} - \mathbf{X}\boldsymbol{\beta}\rVert_2^2 + \lambda\left[\alpha\lVert\boldsymbol{\beta}\rVert_1 + \frac{1-\alpha}{2}\lVert\boldsymbol{\beta}\rVert_2^2\right] \right\rbrace
 $$
 
 其中 $\lambda$ 为正则化强度，$\alpha\in[0,1]$ 控制L1与L2混合比（通过交叉验证自动选择 $\alpha^* = 0.10$，$\lambda^* = 15.06$）。
@@ -137,7 +137,7 @@ $$
 对分类任务使用 **L1正则化Logistic回归**（Lasso Logistic）：
 
 $$
-\hat{\boldsymbol{\beta}} = \arg\min_{\boldsymbol{\beta}} \left\{ -\sum_{i=1}^n \left[y_i \log p_i + (1-y_i)\log(1-p_i)\right] + \lambda\|\boldsymbol{\beta}\|_1 \right\}
+\hat{\boldsymbol{\beta}} = \arg\min_{\boldsymbol{\beta}} \left\lbrace -\sum_{i=1}^n \left[y_i \log p_i + (1-y_i)\log(1-p_i)\right] + \lambda\lVert\boldsymbol{\beta}\rVert_1 \right\rbrace
 $$
 
 $$
