@@ -1,0 +1,8 @@
+﻿评价指标,值
+F1-macro,0.875
+F1-weighted,0.894
+Cohen Kappa,0.788
+高风险概率 AUC（对高血脂二分类）,0.592
+Youden 最优概率阈值,0.001
+灵敏度（Sensitivity）,0.319
+特异度（Specificity）,0.729
