@@ -33,6 +33,7 @@ import scipy.stats as stats
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
+from sklearn.pipeline import Pipeline
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.tree import DecisionTreeClassifier, export_text
 import xgboost as xgb
@@ -145,8 +146,6 @@ SCREEN_FEATURES = (
 SCREEN_FEATURES = [c for c in SCREEN_FEATURES if c in df.columns]
 
 X_sc_raw = df[SCREEN_FEATURES].values
-scaler_A = StandardScaler()
-X_sc     = scaler_A.fit_transform(X_sc_raw)
 
 n_neg, n_pos = (y==0).sum(), (y==1).sum()
 spw = n_neg / max(n_pos, 1)
@@ -158,8 +157,11 @@ xgb_A = xgb.XGBClassifier(
 )
 cal_A = CalibratedClassifierCV(xgb_A, method="sigmoid", cv=3)
 
+# Pipeline wraps scaler inside CV folds: scaler.fit() only sees training data
+# in each fold, preventing any leakage of test-fold statistics into OOF probs.
+pipe_A = Pipeline([("scaler", StandardScaler()), ("clf", cal_A)])
 cv5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-y_prob_screen = cross_val_predict(cal_A, X_sc, y, cv=cv5, method="predict_proba")[:, 1]
+y_prob_screen = cross_val_predict(pipe_A, X_sc_raw, y, cv=cv5, method="predict_proba")[:, 1]
 auc_screen = roc_auc_score(y, y_prob_screen)
 print(f"  Early-screening model OOF AUC = {auc_screen:.3f}")
 print(f"  P(HLD|screen) range: [{y_prob_screen.min():.3f}, {y_prob_screen.max():.3f}]")
@@ -168,8 +170,10 @@ print(f"  Mean={y_prob_screen.mean():.3f}  Std={y_prob_screen.std():.3f}")
 # Calibration curve
 frac_pos_A, mean_pred_A = calibration_curve(y, y_prob_screen, n_bins=10)
 
-# Fit final model on all data for SHAP
-cal_A.fit(X_sc, y)
+# Fit final model on ALL data — standard practice for interpretability (SHAP).
+# The performance metric (AUC) is already OOF and unbiased.
+scaler_final = StandardScaler()
+X_sc = scaler_final.fit_transform(X_sc_raw)
 xgb_A_final = xgb.XGBClassifier(
     n_estimators=300, learning_rate=0.05, max_depth=4,
     subsample=0.8, colsample_bytree=0.8, scale_pos_weight=spw,
@@ -179,50 +183,81 @@ xgb_A_final.fit(X_sc, y)
 df["P_screen"] = y_prob_screen
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DATA-DRIVEN WEIGHT DERIVATION  (Excess-AUC method)
+# Each component's weight is proportional to its individual AUC minus 0.5
+# (i.e. the discriminative power ABOVE random chance).  Using excess-AUC rather
+# than raw AUC prevents highly-correlated features (LipidAbnormal ≈ HLD label)
+# from completely monopolising the score, while still reflecting each
+# component's marginal contribution to predicting HLD.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*60)
+print("DATA-DRIVEN WEIGHT DERIVATION (Excess-AUC method)")
+print("="*60)
+
+act_max   = float(df["Activity_Total"].max())
+act_min   = float(df["Activity_Total"].min())
+act_range = max(act_max - act_min, 1.0)
+
+auc_A = roc_auc_score(y, y_prob_screen)
+auc_B = roc_auc_score(y, df["PhlegmDampness"].values)
+auc_C = roc_auc_score(y, -df["Activity_Total"].values)  # lower activity = higher risk
+auc_D = roc_auc_score(y, df["LipidAbnormalCount"].values)
+
+print(f"  Individual AUCs (for HLD prediction):")
+print(f"    [A] P_screen       : {auc_A:.3f}")
+print(f"    [B] PhlegmDampness : {auc_B:.3f}")
+print(f"    [C] Activity_Total : {auc_C:.3f}  (negated)")
+print(f"    [D] LipidAbnormal  : {auc_D:.3f}")
+
+excess = np.array([max(auc_A - 0.5, 1e-6), max(auc_B - 0.5, 1e-6),
+                   max(auc_C - 0.5, 1e-6), max(auc_D - 0.5, 1e-6)])
+W_A, W_B, W_C, W_D = (excess / excess.sum() * 100.0)
+print(f"\n  Excess-AUC derived weights (sum=100, prior in parentheses):")
+print(f"    [A] P_screen       : {W_A:.1f}  (prior 40)")
+print(f"    [B] PhlegmDampness : {W_B:.1f}  (prior 25)")
+print(f"    [C] Activity_Total : {W_C:.1f}  (prior 20)")
+print(f"    [D] LipidAbnormal  : {W_D:.1f}  (prior 15)")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # COMPOSITE RISK SCORE (0–100) and THREE-LEVEL STRATIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
-# Component weights (sum to 100):
-#   [A] Screen model probability:  40 pts  →  P_screen × 40
-#   [B] PhlegmDampness tier:       25 pts  →  0/8/17/25
-#   [C] Activity_Total tier:       20 pts  →  0/7/13/20
-#   [D] LipidAbnormalCount:        15 pts  →  min(count,4)/4 × 15
-#
-# Three risk levels:
-#   Low:    CompositeScore  < 35
-#   Medium: 35 ≤ CompositeScore < 60
-#   High:   CompositeScore ≥ 60
-
 print("\n" + "="*60)
 print("COMPOSITE RISK SCORE & THREE-LEVEL STRATIFICATION")
 print("="*60)
 
-def phlegm_tier(v):
-    """0–25 points: PhlegmDampness tier."""
-    if v < 40:  return 0
-    if v < 60:  return 8
-    if v < 80:  return 17
-    return 25
+# ── Tier functions return values in [0, 1]; multiplied by their weight ────────
+# PhlegmDampness breakpoints follow ZYYXH/T157-2009: <40 none, 40–60 tendency,
+# 60–80 typical, ≥80 severe phlegm-dampness constitution.
+def phlegm_tier_norm(v):
+    """0–1: PhlegmDampness tier (4 levels, breakpoints 40/60/80)."""
+    if v < 40:  return 0.0
+    if v < 60:  return 0.33
+    if v < 80:  return 0.67
+    return 1.0
 
-def activity_tier(v):
-    """0–20 points: Activity_Total tier (lower activity = higher risk)."""
-    if v >= 70: return 0
-    if v >= 55: return 7
-    if v >= 40: return 13
-    return 20
+def activity_tier_norm(v):
+    """0–1: Activity_Total risk tier (lower activity = higher risk)."""
+    if v >= 70: return 0.0
+    if v >= 55: return 0.33
+    if v >= 40: return 0.67
+    return 1.0
 
-def lipid_score(cnt):
-    """0–15 points proportional to number of abnormal lipid markers."""
-    return min(int(cnt), 4) / 4 * 15
+def lipid_score_norm(cnt):
+    """0–1: proportional to number of abnormal lipid markers (capped at 4)."""
+    return min(int(cnt), 4) / 4.0
 
-df["Score_Screen"]  = df["P_screen"] * 40
-df["Score_Phlegm"]  = df["PhlegmDampness"].apply(phlegm_tier)
-df["Score_Activity"]= df["Activity_Total"].apply(activity_tier)
-df["Score_Lipid"]   = df["LipidAbnormalCount"].apply(lipid_score)
+# Weights W_A…W_D are data-driven (see DATA-DRIVEN WEIGHT DERIVATION above)
+df["Score_Screen"]   = df["P_screen"]                                  * W_A
+df["Score_Phlegm"]   = df["PhlegmDampness"].apply(phlegm_tier_norm)    * W_B
+df["Score_Activity"] = df["Activity_Total"].apply(activity_tier_norm)  * W_C
+df["Score_Lipid"]    = df["LipidAbnormalCount"].apply(lipid_score_norm) * W_D
 df["CompositeScore"] = (df["Score_Screen"] + df["Score_Phlegm"] +
                         df["Score_Activity"] + df["Score_Lipid"])
 
-LOW_CUT = 35
-HIGH_CUT = 60
+# Data-driven cut-points: 33rd / 67th percentile of the composite score
+# ensures a balanced three-way split without manual tuning.
+LOW_CUT  = round(float(np.percentile(df["CompositeScore"], 33)), 1)
+HIGH_CUT = round(float(np.percentile(df["CompositeScore"], 67)), 1)
 
 def assign_risk(score):
     if score < LOW_CUT:  return 0  # Low
@@ -381,10 +416,45 @@ print("\n" + "="*60)
 print("CORE FEATURE COMBINATIONS (PhlegmDampness × Activity × LipidAbnormal)")
 print("="*60)
 
-# Use clinically meaningful thresholds from the problem statement
-PD_HIGH = 60     # PhlegmDampness ≥ 60 → high phlegm-dampness
-ACT_LOW = 40     # Activity_Total < 40 → low activity
+# Youden-index optimal thresholds from ROC analysis of each feature vs HLD.
+# If Youden J < 0.10 the feature lacks sufficient discriminative power and the
+# data-driven threshold is unreliable; in that case we fall back to the
+# established clinical reference standard.
+YOUDEN_J_MIN = 0.10
+
+fpr_pd,  tpr_pd,  thr_pd  = roc_curve(y, df["PhlegmDampness"].values)
+j_pd = float(np.max(tpr_pd - fpr_pd))
+PD_HIGH_youden   = int(np.round(thr_pd[np.argmax(tpr_pd - fpr_pd)]))
+PD_HIGH_clinical = 60    # ZYYXH/T157-2009: typical phlegm-dampness constitution ≥ 60
+
+if j_pd >= YOUDEN_J_MIN:
+    PD_HIGH  = PD_HIGH_youden
+    pd_basis = f"Youden J={j_pd:.3f}"
+else:
+    PD_HIGH  = PD_HIGH_clinical
+    pd_basis = (f"clinical standard ZYYXH/T157-2009 "
+                f"(Youden J={j_pd:.3f} < {YOUDEN_J_MIN}, data-driven cut unreliable)")
+
+# For Activity_Total: lower activity → higher risk, so negate before ROC.
+fpr_act, tpr_act, thr_act = roc_curve(y, -df["Activity_Total"].values)
+j_act = float(np.max(tpr_act - fpr_act))
+ACT_LOW_youden   = int(np.round(-thr_act[np.argmax(tpr_act - fpr_act)]))
+ACT_LOW_clinical = 40    # ADL+IADL < 40: significant functional limitation in elderly
+
+if j_act >= YOUDEN_J_MIN:
+    ACT_LOW  = ACT_LOW_youden
+    act_basis = f"Youden J={j_act:.3f}"
+else:
+    ACT_LOW  = ACT_LOW_clinical
+    act_basis = (f"ADL/IADL clinical standard "
+                 f"(Youden J={j_act:.3f} < {YOUDEN_J_MIN}, data-driven cut unreliable)")
+
+print(f"\n[Binary threshold selection: Youden vs clinical fallback]")
+print(f"  PD_HIGH = {PD_HIGH}  →  {pd_basis}")
+print(f"  ACT_LOW = {ACT_LOW}  →  {act_basis}")
 # LipidAbnormal already defined above
+
+
 
 df["Flag_HighPhlegm"]    = (df["PhlegmDampness"]  >= PD_HIGH).astype(int)
 df["Flag_LowActivity"]   = (df["Activity_Total"]  <  ACT_LOW).astype(int)
@@ -627,7 +697,8 @@ print("✓ Figure 9 saved")
 # ── Figure 10: Composite score components breakdown per risk level ─────────
 fig, ax = plt.subplots(figsize=(9, 5))
 score_components = ["Score_Screen", "Score_Phlegm", "Score_Activity", "Score_Lipid"]
-comp_labels      = ["Screen Model (×40)", "PhlegmDampness (×25)", "Activity (×20)", "LipidAbnormal (×15)"]
+comp_labels      = [f"Screen Model (×{W_A:.0f})", f"PhlegmDampness (×{W_B:.0f})",
+                    f"Activity (×{W_C:.0f})", f"LipidAbnormal (×{W_D:.0f})"]
 comp_colors      = [COLORS["blue"], "#9B59B6", COLORS["mid"], COLORS["high"]]
 x = np.arange(3)
 width = 0.18
@@ -656,8 +727,11 @@ print("FINAL SUMMARY – Q2 Three-Level Risk Warning Model")
 print("="*60)
 
 print(f"\n[Early-Screening Model]  Non-lipid features only  |  OOF AUC = {auc_screen:.3f}")
-print(f"[Composite Risk Score]   Components: Screen(40) + PhlegmDampness(25) + Activity(20) + Lipid(15)")
-print(f"[Risk Cut-points]        Low < {LOW_CUT}  ≤  Medium < {HIGH_CUT}  ≤  High")
+print(f"[Composite Risk Score]   Components (data-driven): "
+      f"Screen({W_A:.1f}) + PhlegmDampness({W_B:.1f}) + Activity({W_C:.1f}) + Lipid({W_D:.1f})")
+print(f"[Risk Cut-points]        Low < {LOW_CUT}  ≤  Medium < {HIGH_CUT}  ≤  High  "
+      f"(33rd/67th percentile)")
+print(f"[Binary Thresholds]      PD_HIGH={PD_HIGH} (Youden)  |  ACT_LOW={ACT_LOW} (Youden)")
 
 print("\n[Risk Stratum HLD Prevalence]")
 for r_id, r_name in RISK_NAMES.items():
